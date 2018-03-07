@@ -17,14 +17,35 @@ import logging
 import binascii
 import datetime
 
-# Import required Common Protos
-from hfc.protos.common import common_pb2
+# Import required Peer Protos
+from hfc.protos.peer import chaincode_pb2
+from hfc.protos.peer import chaincode_event_pb2
+from hfc.protos.peer import transaction_pb2
+from hfc.protos.peer import proposal_pb2
+from hfc.protos.peer import proposal_response_pb2
+from hfc.protos.peer import query_pb2
+from hfc.protos.peer import configuration_pb2 as peer_configuration_pb2
 
 # Import required MSP Protos
+from hfc.protos.msp import msp_principal_pb2
+from hfc.protos.msp import msp_config_pb2
 from hfc.protos.msp import identities_pb2
 
-# Import required Peer Protos
-from hfc.protos.peer import transaction_pb2
+# Import required Common Protos
+from hfc.protos.common import common_pb2
+from hfc.protos.common import configtx_pb2
+from hfc.protos.common import policies_pb2
+from hfc.protos.common import ledger_pb2
+from hfc.protos.common import configuration_pb2 as common_configuration_pb2
+
+# Import required Orderer Protos
+from hfc.protos.orderer import configuration_pb2 as orderer_configuration_pb2
+from hfc.protos.orderer import ab_pb2
+
+# Import required Ledger Protos
+from hfc.protos.ledger.rwset import rwset_pb2
+from hfc.protos.ledger.rwset.kvrwset import kv_rwset_pb2
+
 
 _logger = logging.getLogger(__name__ + ".block_decoder")
 
@@ -82,6 +103,53 @@ class BlockDecoder(object):
             processed_tx['transaction_envelope'] = \
                 decode_block_data_envelope(pr_processed_tx.transactionEnvelope)
         return processed_tx
+
+
+type_as_string = {
+    0: 'MESSAGE',  # Used for messages which are signed but opaque
+    1: 'CONFIG',  # Used for messages which express the channel config
+    2: 'CONFIG_UPDATE',  # Used for transactions which update the channel config
+    3: 'ENDORSER_TRANSACTION',  # Used by the SDK to submit endorser based transactions
+    4: 'ORDERER_TRANSACTION',  # Used internally by the orderer for management
+    5: 'DELIVER_SEEK_INFO',  # Used as the type for Envelope messages submitted to instruct the Deliver API to seek
+    6: 'CHAINCODE_PACKAGE'  # Used for packaging chaincode artifacts for install
+}
+
+implicit_metapolicy_rule = ['ANY', 'ALL', 'MAJORITY']
+
+policy_policy_type = ['UNKNOWN', 'SIGNATURE', 'MSP', 'IMPLICIT_META']
+
+implicit_metapolicy_rule = ['ANY', 'ALL', 'MAJORITY']
+
+
+class HeaderType(object):
+    """
+        HeaderType class having decodePayload and convertToString methods
+    """
+    @staticmethod
+    def convert_to_string(type_value):
+        result = None
+        try:
+            result = type_as_string[type_value]
+        except Exception as e:
+            raise Exception("HeaderType :: convert_to_string", e)
+        if not result:
+            result = 'UNKNOWN_TYPE'
+        return result
+
+    @staticmethod
+    def decode_payload_based_on_type(proto_data, type_value):
+        result = None
+        if type_value == 1:
+            result = decode_config_envelope(proto_data)
+        elif type_value == 2:
+            result = decode_config_update_envelope(proto_data)
+        elif type_value == 3:
+            result = decode_endorser_transaction(proto_data)
+        else:
+            _logger.debug('HeaderType :: decode_payload found a header type of {} :: {}'.format(type_value, HeaderType.convert_to_string(type_value)))
+            result = {}
+        return result
 
 
 def decode_block_header(proto_block_header):
@@ -343,3 +411,430 @@ def decode_transaction_filter(metadata_bytes):
     for i in metadata_bytes:
         transaction_filter.append(int(i))
     return transaction_filter
+
+
+def decode_endorser_transaction(trans_bytes):
+    """Decodes
+
+    Args:
+        trans_bytes {[type]}: Serialized endorser transaction bytes
+
+    Returns: deserialized dictionary of endorser transaction data
+    """
+    data = {}
+    if trans_bytes:
+        transaction = transaction_pb2.Transaction()
+        transaction.ParseFromString(trans_bytes)
+        data['actions'] = []
+        if transaction and transaction.actions:
+            for tx_action in transaction.actions:
+                action = {}
+                action['header'] = decode_signature_header(tx_action.header)
+                action['payload'] = decode_chaincode_action_payload(tx_action.payload)
+                data['actions'].append(action)
+    return data
+
+
+def decode_config_envelope(config_envelope_bytes):
+    """Decodes configuration envelope
+
+    Args:
+        config_envelope_bytes: byte of config envelope
+
+    Returns: deserialized config envelope
+    """
+    config_envelope = {}
+    proto_config_envelope = configtx_pb2.ConfigEnvelope()
+    proto_config_envelope.ParseFromString(config_envelope_bytes)
+    config_envelope['config'] = decode_config(proto_config_envelope.config)
+    config_envelope['last_update'] = {}
+    proto_last_update = proto_config_envelope.last_update
+    if proto_last_update:
+        config_envelope['last_update']['payload'] = {}
+        proto_payload = common_pb2.Payload()
+        proto_payload.ParseFromString(proto_last_update.payload)
+        config_envelope['last_update']['payload']['header'] = decode_header(proto_payload.header)
+        config_envelope['last_update']['payload']['data'] = decode_config_update_envelope(proto_payload.data)
+        config_envelope['last_update']['signature'] = proto_last_update.signature
+    return config_envelope
+
+
+def decode_config(proto_config):
+    """Decodes configuration from config envelope
+    
+    Args:
+        proto_config (bytes): Config value
+
+    Returns: deserialized config
+    """
+    config = {}
+    config['sequence'] = str(proto_config.sequence)
+    config['channel_group'] = decode_config_group(proto_config.channel_group)
+    # config['type'] = proto_config.type
+    # TODO: getType() equivalent
+    return config
+
+
+def decode_config_update_envelope(config_update_envelope_bytes):
+    """Decode config update envelope
+    
+    Args:
+        config_update_envelope_bytes (str): Bytes of update envelope
+
+    Returns: deserialized config update envelope signatures
+    """
+    config_update_envelope = {}
+    proto_config_update_envelope = configtx_pb2.ConfigUpdateEnvelope()
+    proto_config_update_envelope.ParseFromString(config_update_envelope_bytes)
+    config_update_envelope['config_update'] = decode_config_update(proto_config_update_envelope.config_update)
+    signatures = []
+    for signature in proto_config_update_envelope.signatures:
+        proto_config_signature = signature
+        config_signature = decode_config_signature(proto_config_signature)
+        signatures.push(config_signature)
+    config_update_envelope['signatures'] = signatures
+    return config_update_envelope
+
+
+def decode_config_update(config_update_bytes):
+    """Decodes update bytes in configuration
+    
+    Args:
+        config_update_bytes (str): Bytes
+ 
+    Returns: deserialized configuration update
+    """
+    config_update = {}
+    proto_config_update = configtx_pb2.ConfigUpdate()
+    proto_config_envelope.ParseFromString(config_update_bytes)
+    config_update['channel_id'] = proto_config_update.channel_id
+    config_update['read_set'] = decode_config_group(proto_config_update.read_set)
+    config_update['write_set'] = decode_config_group(proto_config_update.write_set)
+    # config_update['type'] = proto_config_update TODO: getType() equivalent
+    return config_update
+
+
+def decode_config_groups(config_group_map):
+    """Decodes configuration groups inside ConfigGroup
+    
+    Args:
+        config_group_map (str): Serialized ConfigGroup.groups object
+
+    Returns: map of configuration groups.
+    """
+    config_groups = {}
+    # keys =
+    # TODO: Fill in the rest
+    return config_groups
+
+
+def decode_config_group(proto_config_group):
+    """Decodes configuration group from config protos
+    
+    Args:
+        proto_config_group (str): serialized ConfigGroup() object
+
+    Returns: deserialized config_groups dictionary
+    """
+
+    if not proto_config_group:
+        return None
+    config_group = {}
+    config_group['version'] = decode_version(proto_config_group.version)
+    config_group['groups'] = decode_config_groups(proto_config_group.groups)
+    config_group['values'] = decode_config_values(proto_config_group.values)
+    config_group['policies'] = decode_config_policies(proto_config_group.policies)
+    config_group['mod_policy'] = proto_config_group.mod_policy
+    return config_group
+
+
+def decode_config_values(config_value_map):
+    """Decodes configuration values inside each configuration key
+
+    Args:
+        config_value_map (str): Serialized values map for each config key
+
+    Returns: map of configuration values for each key
+    """
+    config_values = {}
+    # keys =
+    # TODO: Fill in the rest
+    return config_values
+
+
+def decode_config_value(proto_config_value):
+    """Decodes
+
+    Args:
+        trans_bytes {[type]} -- [description]
+    """
+    config_value_key = proto_config_value.key
+    config_value = {}
+    config_value['version'] = decode_version(proto_config_value.value.version)
+    config_value['mod_policy'] = proto_config_value.value.mod_policy
+    config_value['value'] = {}
+    if config_value_key == 'AnchorPeers':
+        pass
+    elif config_value_key == 'MSP':
+        pass
+    elif config_value_key == 'ConsensusType':
+        pass
+    elif config_value_key == 'BatchSize':
+        pass
+    elif config_value_key == 'BatchTimeout':
+        pass
+    elif config_value_key == 'ChannelRestrictions':
+        pass
+    elif config_value_key == 'CreationPolicy':
+        pass
+    elif config_value_key == 'Consortium':
+        pass
+    elif config_value_key == 'ChainCreationPolicyNames':
+        pass
+    elif config_value_key == 'HashingAlgorithm':
+        pass
+    elif config_value_key == 'BlockDataHashingStructure':
+        pass
+    elif config_value_key == 'OrdererAddresses':
+        pass
+    else:
+        pass
+    return config_value
+
+
+def decode_config_policies(config_policy_map):
+    """Decodes list of configuration policies
+
+    Args:
+        config_policy_map (str): Serialized list of configuration policies
+
+    Returns: deserialized map of config policies.
+    """
+    config_policies = {}
+    # keys =
+    return config_policies
+
+
+def decode_config_policy(proto_config_policy):
+    """Decodes
+
+    Args:
+        trans_bytes {[type]} -- [description]
+    """
+    pass
+
+
+def decode_implicit_meta_policy(implicit_meta_policy_bytes):
+    """Decodes
+
+    Args:
+        trans_bytes {[type]} -- [description]
+    """
+    pass
+
+
+def decode_signature_policy_envelope(signature_policy_envelope_bytes):
+    """Decodes
+
+    Args:
+        trans_bytes {[type]} -- [description]
+    """
+    pass
+
+
+def decode_signature_policy(proto_signature_policy):
+    """Decodes
+
+    Args:
+        trans_bytes {[type]} -- [description]
+    """
+    pass
+
+
+def decode_MSP_principal(proto_msp_principal):
+    """Decodes
+
+    Args:
+        trans_bytes {[type]} -- [description]
+    """
+    pass
+
+
+def decode_config_signature(proto_configSignature):
+    """Decodes
+
+    Args:
+        trans_bytes {[type]} -- [description]
+    """
+    pass
+
+
+def decode_fabric_MSP_config(msp_config_bytes):
+    """Decodes
+
+    Args:
+        trans_bytes {[type]} -- [description]
+    """
+    pass
+
+
+def decode_fabric_OU_identifier(proto_organizational_unit_identitfiers):
+    """Decodes
+
+    Args:
+        trans_bytes {[type]} -- [description]
+    """
+    pass
+
+
+def to_PEM_certs(buffer_array_in):
+    """Decodes
+
+    Args:
+        trans_bytes {[type]} -- [description]
+    """
+    pass
+
+
+def decode_signing_identity_info(signing_identity_info_bytes):
+    """Decodes
+
+    Args:
+        trans_bytes {[type]} -- [description]
+    """
+    pass
+
+
+def decode_key_info(key_info_bytes):
+    """Decodes
+
+    Args:
+        trans_bytes {[type]} -- [description]
+    """
+    pass
+
+
+def decode_chaincode_action_payload(payload_bytes):
+    """Decodes
+
+    Args:
+        trans_bytes {[type]} -- [description]
+    """
+    pass
+
+
+def decode_chaincode_proposal_payload(chaincode_proposal_payload_bytes):
+    """Decodes
+
+    Args:
+        trans_bytes {[type]} -- [description]
+    """
+    pass
+
+
+def decode_chaincode_endorsed_action(proto_chaincode_endorsed_action):
+    """Decodes
+
+    Args:
+        trans_bytes {[type]} -- [description]
+    """
+    pass
+
+
+def decode_endorsement(proto_endorsement):
+    """Decodes
+
+    Args:
+        trans_bytes {[type]} -- [description]
+    """
+    pass
+
+
+def decode_proposal_response_payload(proposal_response_payload_bytes):
+    """Decodes
+
+    Args:
+        trans_bytes {[type]} -- [description]
+    """
+    pass
+
+
+def decode_chaincode_action(action_bytes):
+    """Decodes
+
+    Args:
+        trans_bytes {[type]} -- [description]
+    """
+    pass
+
+
+def decode_chaincode_events(event_bytes):
+    """Decodes
+
+    Args:
+        trans_bytes {[type]} -- [description]
+    """
+    pass
+
+
+def decode_chaincode_id(proto_chaincode_id):
+    """Decodes
+
+    Args:
+        trans_bytes {[type]} -- [description]
+    """
+    pass
+
+
+def decode_readwrite_sets(rw_sets_bytes):
+    """Decodes
+
+    Args:
+        trans_bytes {[type]} -- [description]
+    """
+    pass
+
+
+def decode_kv_rw_set(kv_bytes):
+    """Decodes
+
+    Args:
+        trans_bytes {[type]} -- [description]
+    """
+    pass
+
+
+def decode_kv_read(proto_kv_read):
+    """Decodes
+
+    Args:
+        trans_bytes {[type]} -- [description]
+    """
+    pass
+
+
+def decode_range_query_info(proto_range_query_info):
+    """Decodes
+    
+    Args:
+        proto_range_query_info {[type]} -- [description]
+    """
+    pass
+
+
+def decode_kv_write(proto_kv_write):
+    """Decodes
+    
+    Args:
+        proto_range_query_info {[type]} -- [description]
+    """
+    pass
+
+
+def decode_response(proto_response):
+    """Decodes
+    
+    Args:
+        proto_range_query_info {[type]} -- [description]
+    """
+    pass
